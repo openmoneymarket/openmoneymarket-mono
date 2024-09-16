@@ -71,6 +71,14 @@ class RewardInterface(InterfaceScore):
     def transferOmmToDaoFund(self, _value: int):
         pass
 
+    @interface
+    def enableHandleActions(self):
+        pass
+
+    @interface
+    def disableHandleActions(self):
+        pass
+
 
 class StakedLPInterface(InterfaceScore):
     @interface
@@ -138,19 +146,15 @@ class FeeProviderInterface(InterfaceScore):
 
 class OmmTokenInterface(InterfaceScore):
     @interface
-    def totalSupply(self) -> int:
-        pass
-
-    @interface
-    def stakedBalanceOfAt(self, _owner: Address, _timestamp: int) -> int:
-        pass
-
-    @interface
-    def totalStakedBalanceOfAt(self, _timestamp: int) -> int:
-        pass
-
-    @interface
     def transfer(self, _to: Address, _value: int, _data: bytes = None):
         pass
 
 
+class BoostedOmmInterface(InterfaceScore):
+    @interface
+    def balanceOfAt(self, address: Address, block: int) -> int:
+        pass
+
+    @interface
+    def totalSupplyAt(self, block: int) -> int:
+        pass
