@@ -8,22 +8,29 @@ class Delegation(Addresses):
     _USER_PREPS = 'userPreps'
     _PERCENTAGE_DELEGATIONS = 'percentageDelegations'
     _PREP_VOTES = 'prepVotes'
-    _USER_VOTES = 'userVotes'
     _TOTAL_VOTES = 'totalVotes'
     _EQUAL_DISTRIBUTION = 'equalDistribution'
     _CONTRIBUTORS = 'contributors'
     _VOTE_THRESHOLD = 'voteThreshold'
 
+    _WORKING_BALANCE = 'working_balance'
+    _WORKING_TOTAL_SUPPLY = 'working_total_supply'
+
+    _LOCKED_PREPS = 'lockedPreps'
+    _LOCKED_PREP_VOTES = 'lockedPrepVotes'
+
     def __init__(self, db: IconScoreDatabase) -> None:
         super().__init__(db)
-        self._preps = EnumerableSetDB(self._PREPS, db, value_type=Address)
+        self._preps = EnumerableSetDB(self._LOCKED_PREPS, db, value_type=Address)
         self._userPreps = DictDB(self._USER_PREPS, db, value_type=Address, depth=2)
         self._percentageDelegations = DictDB(self._PERCENTAGE_DELEGATIONS, db, value_type=int, depth=2)
-        self._prepVotes = DictDB(self._PREP_VOTES, db, value_type=int)
-        self._userVotes = DictDB(self._USER_VOTES, db, value_type=int)
-        self._totalVotes = VarDB(self._TOTAL_VOTES, db, value_type=int)
+        self._prepVotes = DictDB(self._LOCKED_PREP_VOTES, db, value_type=int)
+        # self._totalVotes = VarDB(self._TOTAL_VOTES, db, value_type=int)
         self._contributors = ArrayDB(self._CONTRIBUTORS, db, value_type=Address)
         self._voteThreshold = VarDB(self._VOTE_THRESHOLD, db, value_type=int)
+
+        self._working_total_supply = VarDB(self._WORKING_TOTAL_SUPPLY, db, value_type=int)
+        self._working_balance = DictDB(self._WORKING_BALANCE, db, value_type=int)
 
     def on_install(self, _addressProvider: Address) -> None:
         super().on_install(_addressProvider)
@@ -31,6 +38,34 @@ class Delegation(Addresses):
 
     def on_update(self) -> None:
         super().on_update()
+        self._working_total_supply.set(0)
+
+    @external
+    @only_owner
+    def initializeVotesToContributors(self) -> None:
+        core = self.create_interface_score(self._addresses[LENDING_POOL_CORE], LendingPoolCoreInterface)
+        core.updatePrepDelegations(self._initializeVotesToContributors())
+
+    def _initializeVotesToContributors(self):
+        delegations = []
+        total_percentage = 0
+
+        defaultDelegation = self._distributeVoteToContributors()
+        for delegation in defaultDelegation:
+            votes: int = delegation['_votes_in_per']
+            prep: Address = delegation['_address']
+
+            vote_percentage = votes * 100
+            total_percentage += vote_percentage
+            delegations.append({
+                '_votes_in_per': vote_percentage,
+                '_address': prep
+            })
+        dust_votes = 100 * EXA - total_percentage
+        if dust_votes > 0:
+            delegations[0]['_votes_in_per'] += dust_votes
+
+        return delegations
 
     @staticmethod
     def _require(_condition: bool, _message: str):
@@ -92,12 +127,13 @@ class Delegation(Addresses):
         return self._distributeVoteToContributors() == self.getUserDelegationDetails(_user)
 
     def _resetUser(self, _user: Address):
-        if self.msg.sender == self._addresses[OMM_TOKEN] or self.msg.sender == _user:
-            prepVotes = 0
+        if self.msg.sender == self._addresses[BOOSTED_OMM] or self.msg.sender == _user:
+            working_balance = self._working_balance[_user]
+            # prepVotes = 0
             for index in range(5):
 
                 # removing votes
-                prep_vote = exaMul(self._percentageDelegations[_user][index], self._userVotes[_user])
+                prep_vote = exaMul(self._percentageDelegations[_user][index], working_balance)
                 if prep_vote > 0:
                     self._prepVotes[self._userPreps[_user][index]] -= prep_vote
 
@@ -106,10 +142,9 @@ class Delegation(Addresses):
                 self._percentageDelegations[_user][index] = 0
 
                 # calculating total user votes
-                prepVotes += prep_vote
+                # prepVotes += prep_vote
 
-            self._totalVotes.set(self._totalVotes.get() - prepVotes)
-            self._userVotes[_user] = 0
+            # self._totalVotes.set(self._totalVotes.get() - prepVotes)
 
     def _validatePrep(self, _address):
         governance = self.create_interface_score(ZERO_SCORE_ADDRESS, GovernanceContractInterface)
@@ -126,9 +161,29 @@ class Delegation(Addresses):
     def getPrepList(self) -> List[Address]:
         return [prep for prep in self._preps.range(0, len(self._preps))]
 
+    def _update_working_balance(self, _user: Address) -> int:
+        boosted_omm = self.create_interface_score(self._addresses[BOOSTED_OMM], BoostedOmmInterface)
+        new_working_balance = boosted_omm.balanceOf(_user)
+
+        current_working_total_supply = self._working_total_supply.get()
+        current_working_balance = self._working_balance[_user]
+
+        self._working_balance[_user] = new_working_balance
+        new_working_total_supply = current_working_total_supply + new_working_balance - current_working_balance
+        self._working_total_supply.set(new_working_total_supply)
+        return new_working_balance
+
+    @external
+    def kick(self, _user: Address):
+        boosted_omm = self.create_interface_score(self._addresses[BOOSTED_OMM], BoostedOmmInterface)
+        bomm_balance = boosted_omm.balanceOf(_user)
+        self._require(bomm_balance == 0, f'{TAG}: boost lock is not expired')
+        self._update_working_balance(_user)
+        self.updateDelegations(_user=_user)
+
     @external
     def updateDelegations(self, _delegations: List[PrepDelegations] = None, _user: Address = None):
-        if _user is not None and self.msg.sender == self._addresses[OMM_TOKEN]:
+        if _user is not None and self.msg.sender == self._addresses[BOOSTED_OMM]:
             user = _user
         else:
             user = self.msg.sender
@@ -149,11 +204,10 @@ class Delegation(Addresses):
 
     def _handleCalculation(self, delegations, user):
         total_percentage = 0
-        omm_token = self.create_interface_score(self._addresses[OMM_TOKEN], OmmTokenInterface)
-        user_staked_token = omm_token.details_balanceOf(user)['stakedBalance']
-        prepVotes = 0
         # resetting previous delegation preferences
         self._resetUser(user)
+        working_balance = self._update_working_balance(user)
+        # prepVotes = 0
         for index, delegation in enumerate(delegations):
             address: Address = delegation['_address']
             votes: int = delegation['_votes_in_per']
@@ -164,7 +218,7 @@ class Delegation(Addresses):
                 self._preps.add(address)
 
             # adding delegation to new preps
-            prep_vote = exaMul(votes, user_staked_token)
+            prep_vote = exaMul(votes, working_balance)
             self._prepVotes[address] += prep_vote
 
             # updating the delegation preferences
@@ -172,7 +226,7 @@ class Delegation(Addresses):
             self._percentageDelegations[user][index] = votes
 
             # adjusting total votes
-            prepVotes += prep_vote
+            # prepVotes += prep_vote
             total_percentage += votes
         self._require(total_percentage == EXA,
                       f'{TAG}: '
@@ -181,8 +235,7 @@ class Delegation(Addresses):
                       f'delegation preferences {delegations}'
                       )
 
-        self._userVotes[user] = user_staked_token
-        self._totalVotes.set(self._totalVotes.get() + prepVotes)
+        # self._totalVotes.set(self._totalVotes.get() + prepVotes)
 
         # get updated prep percentages
         updated_delegation = self.computeDelegationPercentages()
@@ -215,14 +268,21 @@ class Delegation(Addresses):
         return self._prepVotes[_prep]
 
     @external(readonly=True)
+    def getWorkingBalance(self, _user: Address) -> int:
+        return self._working_balance[_user]
+
+    @external(readonly=True)
+    def getWorkingTotalSupply(self) -> int:
+        return self._working_total_supply.get()
+
+    @external(readonly=True)
     def userPrepVotes(self, _user: Address) -> dict:
         response = {}
-        omm_token = self.create_interface_score(self._addresses[OMM_TOKEN], OmmTokenInterface)
-        user_staked_token = omm_token.details_balanceOf(_user)['stakedBalance']
+        working_balance = self._working_balance[_user]
         for index in range(5):
             prep: Address = self._userPreps[_user][index]
             if prep != ZERO_SCORE_ADDRESS and prep is not None:
-                response[str(prep)] = exaMul(self._percentageDelegations[_user][index], user_staked_token)
+                response[str(prep)] = exaMul(self._percentageDelegations[_user][index], working_balance)
         return response
 
     @external(readonly=True)
@@ -242,19 +302,22 @@ class Delegation(Addresses):
     @external(readonly=True)
     def getUserICXDelegation(self, _user: Address) -> List[PrepICXDelegations]:
         user_details = []
-        omm_token = self.create_interface_score(self._addresses[OMM_TOKEN], OmmTokenInterface)
+
+        working_balance = self._working_balance[_user]
+        working_total_supply = self._working_total_supply.get()
+
         sicx = self.create_interface_score(self._addresses[SICX], TokenInterface)
         staking = self.create_interface_score(self._addresses[STAKING], StakingInterface)
-        user_staked_token = omm_token.details_balanceOf(_user)['stakedBalance']
-        total_staked_token = omm_token.getTotalStaked()['totalStaked']
+
         core_sicx_balance = sicx.balanceOf(self._addresses[LENDING_POOL_CORE])
         sicx_icx_rate = staking.getTodayRate()
-        omm_icx_power = exaMul(sicx_icx_rate, exaDiv(core_sicx_balance, total_staked_token))
+        omm_icx_power = exaMul(sicx_icx_rate, exaDiv(core_sicx_balance, working_total_supply))
+
         for index in range(5):
             prep: Address = self._userPreps[_user][index]
             if prep != ZERO_SCORE_ADDRESS and prep is not None:
                 votes_in_per = self._percentageDelegations[_user][index]
-                votes_in_icx = exaMul(omm_icx_power, exaMul(votes_in_per, user_staked_token))
+                votes_in_icx = exaMul(omm_icx_power, exaMul(votes_in_per, working_balance))
                 user_details.append({
                     '_address': prep,
                     '_votes_in_per': votes_in_per,
@@ -265,7 +328,8 @@ class Delegation(Addresses):
 
     @external(readonly=True)
     def computeDelegationPercentages(self) -> List[PrepDelegations]:
-        total_votes = self._totalVotes.get()
+        # total_votes = self._totalVotes.get()
+        total_votes = self._working_total_supply.get()
         if total_votes == 0:
             default_preference = self._distributeVoteToContributors()
             for index in range(len(default_preference)):

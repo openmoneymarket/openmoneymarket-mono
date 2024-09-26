@@ -28,13 +28,21 @@ class SystemInterface(InterfaceScore):
         pass
 
 
-class OmmTokenInterface(InterfaceScore):
+class BoostedOmmInterface(InterfaceScore):
     @interface
-    def details_balanceOf(self, _owner: Address) -> dict:
+    def balanceOf(self, _owner: Address) -> int:
         pass
 
     @interface
-    def getTotalStaked(self) -> TotalStaked:
+    def totalSupply(self) -> int:
+        pass
+
+    @interface
+    def getLocked(self, _user: Address) -> dict:
+        pass
+
+    @interface
+    def getTotalLocked(self) -> int:
         pass
 
 
